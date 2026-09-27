@@ -1,0 +1,209 @@
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - ufw
+
+write_files:
+  - path: /etc/sysctl.d/70-livekit.conf
+    content: |
+      net.core.rmem_max=16777216
+      net.core.wmem_max=16777216
+
+  - path: /opt/matrix/docker-compose.yml
+    content: |
+      name: buncha
+      services:
+        postgres:
+          image: postgres:16-alpine
+          restart: unless-stopped
+          environment:
+            POSTGRES_USER: synapse
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            POSTGRES_DB: synapse
+            POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+          volumes:
+            - ./postgres:/var/lib/postgresql/data
+          healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U synapse"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+
+        synapse:
+          image: ghcr.io/element-hq/synapse:latest
+          restart: unless-stopped
+          environment:
+            SYNAPSE_SERVER_NAME: ${MATRIX_DOMAIN}
+            SYNAPSE_REPORT_STATS: "yes"
+          volumes:
+            - ./synapse:/data
+          depends_on:
+            postgres:
+              condition: service_healthy
+
+        livekit:
+          image: livekit/livekit-server:latest
+          restart: unless-stopped
+          command: --config /etc/livekit.yaml
+          network_mode: host
+          volumes:
+            - ./livekit.yaml:/etc/livekit.yaml:ro
+
+        element:
+          image: vectorim/element-web:latest
+          restart: unless-stopped
+
+        mautrix-discord:
+          image: dock.mau.dev/mautrix/discord:latest
+          restart: unless-stopped
+          volumes:
+            - ./mautrix-discord:/data
+
+        caddy:
+          image: caddy:2
+          restart: unless-stopped
+          ports:
+            - "80:80"
+            - "443:443"
+            - "443:443/udp"
+          environment:
+            MATRIX_DOMAIN: ${MATRIX_DOMAIN}
+            LIVEKIT_DOMAIN: ${LIVEKIT_DOMAIN}
+            ELEMENT_DOMAIN: ${ELEMENT_DOMAIN}
+          extra_hosts:
+            - "host.docker.internal:host-gateway"
+          volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - ./caddy-data:/data
+            - ./caddy-config:/config
+
+  - path: /opt/matrix/Caddyfile
+    content: |
+      {$MATRIX_DOMAIN} {
+          reverse_proxy /_matrix/* synapse:8008
+          reverse_proxy /_synapse/client/* synapse:8008
+      }
+
+      {$ELEMENT_DOMAIN} {
+          reverse_proxy element:80
+      }
+
+      {$LIVEKIT_DOMAIN} {
+          reverse_proxy host.docker.internal:7880
+      }
+
+  - path: /opt/matrix/livekit.yaml
+    content: |
+      port: 7880
+      bind_addresses:
+        - "0.0.0.0"
+      rtc:
+        tcp_port: 7881
+        port_range_start: 50000
+        port_range_end: 60000
+        use_external_ip: true
+      keys:
+        devkey: "CHANGE-ME-devkey-secret"
+
+  - path: /opt/matrix/apply-env.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      cd /opt/matrix
+      source .env
+      mkdir -p element
+      cat > element/config.json <<EOF
+      {
+        "default_server_config": {
+          "m.homeserver": {
+            "base_url": "https://${MATRIX_DOMAIN}",
+            "server_name": "${MATRIX_DOMAIN}"
+          }
+        },
+        "brand": "Matrix",
+        "disable_guests": true
+      }
+      EOF
+      docker compose up -d --force-recreate caddy element
+
+  - path: /opt/matrix/bootstrap.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      cd /opt/matrix
+
+      if [ ! -f .env ]; then
+        cat > .env <<EOF
+      POSTGRES_PASSWORD=$(openssl rand -hex 16)
+      MATRIX_DOMAIN=matrix.example.com
+      LIVEKIT_DOMAIN=livekit.example.com
+      ELEMENT_DOMAIN=chat.example.com
+      EOF
+      fi
+      source .env
+      mkdir -p synapse
+
+      docker compose up -d postgres
+
+      if [ ! -f synapse/homeserver.yaml ]; then
+        docker compose run --rm synapse generate
+        python3 - "$POSTGRES_PASSWORD" <<'PYEOF'
+      import re
+      import sys
+      path = "/opt/matrix/synapse/homeserver.yaml"
+      s = open(path).read()
+      repl = (
+          "database:\n"
+          "  name: psycopg2\n"
+          "  args:\n"
+          "    user: synapse\n"
+          '    password: "' + sys.argv[1] + '"\n'
+          "    database: synapse\n"
+          "    host: postgres\n"
+          "    port: 5432\n"
+          "    cp_min: 5\n"
+          "    cp_max: 10\n"
+      )
+      s = re.sub(
+          r"database:\s*\n\s*name: sqlite3\s*\n\s*args:\s*\n\s*database: /data/homeserver\.db\s*\n",
+          repl,
+          s,
+          count=1,
+      )
+      open(path, "w").write(s)
+      PYEOF
+      fi
+
+      ./apply-env.sh
+      docker compose up -d
+      echo "Create an admin user with:"
+      echo "  cd /opt/matrix && sudo docker compose exec synapse register_new_matrix_user -c /data/homeserver.yaml -a"
+
+bootcmd:
+  # This host's IPv6 is broken (apt/Docker pulls fail with
+  # "dial tcp [2600:...]:443: network is unreachable"), so force IPv4 *before*
+  # anything tries to use the network, and disable IPv6 entirely.
+  - echo 'Acquire::ForceIPv4 true;' > /etc/apt/apt.conf.d/99force-ipv4
+  - printf 'net.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nnet.ipv6.conf.lo.disable_ipv6=1\n' > /etc/sysctl.d/99-disable-ipv6.conf
+  - sysctl --system
+
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  - sysctl --system
+  - ufw limit 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw allow 443/udp
+  - ufw allow 7881/tcp
+  - ufw allow 3478/tcp
+  - ufw allow 3478/udp
+  - ufw allow 50000:60000/udp
+  - ufw --force enable
+  - bash /opt/matrix/bootstrap.sh > /var/log/matrix-bootstrap.log 2>&1
+
+final_message: "Matrix stack cloud-init complete. Bootstrap log: /var/log/matrix-bootstrap.log"

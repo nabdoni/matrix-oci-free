@@ -1,0 +1,11 @@
+tenancy_ocid     = "ocid1.tenancy.oc1..XXXX"
+user_ocid        = "ocid1.user.oc1..XXXX"
+fingerprint      = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+private_key_path = "C:/Users/User/.oci/oci_api_key.pem"
+region           = "us-ashburn-1"
+
+ssh_public_key = "ssh-ed25519 AAAA... you@host"
+admin_cidr     = "0.0.0.0/0"
+
+objectstorage_namespace = "<namespace>"
+admin_email             = "you@example.com"

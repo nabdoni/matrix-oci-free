@@ -1,0 +1,37 @@
+# Terraform / OCI
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Secrets — never commit real values
+*.tfvars
+!terraform.tfvars.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.env
+.env.*
+!.env.example
+
+# Bridge / secrets pulled from the VPS at runtime
+mautrix-discord/
+*.registration.yaml
+homeserver.yaml
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Discord sizing spike: exports, database, channel names (private data)
+importer/sizing/work/
